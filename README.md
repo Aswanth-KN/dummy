@@ -1,383 +1,186 @@
-# Running the shell API and Keycloak on a Windows VM
+# IPS FusionHub Authentication
 
-For a Windows machine that already has a copy of this folder. It covers the
-backend only: PostgreSQL, Keycloak, and the shell API. The four frontends are
-unchanged — `npm run dev` in each — and are not part of this guide.
+This repository contains several FastAPI services and a local Keycloak installation. Authentication is centralized around the shell API, which acts as a backend-for-frontend (BFF) for browser sign-in. The admin API can validate bearer access tokens directly and can also resolve the shell session. The agent API uses machine-to-machine credentials for Databricks.
 
-Everything is run from **PowerShell**, from the folder you copied to. That
-folder is written as `C:\SOW2` below; substitute your own path.
+## Architecture
 
----
+```text
+Browser / SPA
+    |
+    | browser redirects and credentialed requests
+    v
+Shell API (:8000)
+    |  Authorization Code + PKCE
+    |  confidential client: session
+    |  server-side SQLite session store
+    v
+Keycloak (:8080, realm: honeywell)
 
-## 0. Prepare what you copied
+Shell session or bearer access token
+    |
+    +--> Admin API
+    |       verifies JWT with Keycloak JWKS
+    |       checks live realm roles through Keycloak Admin API
+    |
+    +--> Other resource APIs
 
-### 0a. Re-copy, if you copied before today
-
-Several files changed on the Linux machine today, and some of them break the
-setup silently if they are stale. **Copy these two folders across again**, over
-the top of what you already have:
-
-```
-HW-Backend\
-scripts\
-```
-
-Plus `WINDOWS_SETUP.md` — this file.
-
-What changed, so you can spot it if you would rather check than re-copy:
-
-| Change | Symptom if the old version is used |
-| --- | --- |
-| `unified-portal-shell-api\.env` gained the session settings | Login fails at the callback; `SESSION_DATABASE_URL` is empty |
-| Four modules renamed (`kc_admin`→`core\keycloak_admin`, `oidc_bff`→`login_flow`, `dev_swagger`→`local_email_sign_in`, `dev_login`→`local_login_token`) | `ModuleNotFoundError` at startup if the folders are mixed |
-| New `keycloak\import_realm_roles.py`, `export_realm.py`, `realm-roles-export.json` | Step 7 has nothing to run |
-| New `scripts\windows\env.ps1` | Step 4 has nothing to dot-source |
-
-If you mix old and new files you will get a half-renamed `app\` folder, which
-fails on import. If in doubt, delete `C:\SOW2\HW-Backend\unified-portal-shell-api\app`
-before re-copying rather than merging into it.
-
----
-
-### 0b. Three things the copy brought that you must delete
-
-A file copy carries files, not state. Three of the folders you copied are Linux
-build output and will either fail or mislead you.
-
-```powershell
-cd C:\SOW2
-
-# A Linux virtualenv. Its bin\ holds ELF binaries; Windows needs Scripts\.
-Remove-Item -Recurse -Force HW-Backend\env
-
-# PID files from the Linux run scripts, pointing at processes on another machine.
-Remove-Item -Recurse -Force var -ErrorAction SilentlyContinue
-
-# Keycloak's embedded H2 database, left over from before it was pointed at
-# PostgreSQL. Unused, but confusing to find later.
-Remove-Item -Recurse -Force keycloak-26.7.0\data\h2 -ErrorAction SilentlyContinue
-Remove-Item -Recurse -Force keycloak-26.7.0\data\transaction-logs -ErrorAction SilentlyContinue
+Agent API
+    |
+    +--> Databricks SDK OAuth client credentials
 ```
 
-**Do not delete `keycloak-26.7.0\providers\keycloak-magic-link-0.75.jar`.** The
-realm's login flow uses the `login-token-verifier` authenticator from that jar,
-and `setup_local_dev.py` aborts without it. Keep `data\import\` too.
+The browser does not receive the Keycloak authorization code, access token, refresh token, ID token, or client secret. It receives an opaque session cookie and a separate CSRF cookie.
 
-### What did not travel at all
+## Browser Login Flow
 
-Your realm's roles, permissions and users live in Keycloak's PostgreSQL
-database on the Linux machine. `keycloak-26.7.0\data\import\realm-export.json`
-is a 2.5 KB stub — realm settings, the `hw-bff` client, and two placeholder
-users with no roles. It does **not** contain:
+1. The SPA calls `GET /api/v1/auth/config` to obtain public OIDC settings such as the issuer, authorization endpoint, client id, scopes, and callback URLs.
+2. The SPA navigates to `GET /api/v1/auth/login`. This is a top-level redirect, not an XHR.
+3. The shell API creates a one-time transaction containing:
+   - a PKCE verifier;
+   - an OIDC nonce;
+   - an opaque state value;
+   - a browser-binding transaction secret;
+   - a validated return path.
+4. The shell stores the transaction in SQLite and sends the browser to Keycloak with Authorization Code + PKCE (`S256`).
+5. Keycloak authenticates the user and redirects to `/api/v1/auth/callback` with `code` and `state`.
+6. The shell consumes the transaction exactly once, verifies the transaction cookie, exchanges the code server-to-server, and validates the ID token signature, issuer, audience, required claims, and nonce.
+7. The shell stores the access, refresh, and ID tokens in the server-side session database. It returns only cookies and redirects the browser back to the SPA.
 
-- the three job roles `admin`, `developer`, `developers`
-- the ten `permission:*` roles
-- the composites that make `developers` grant its four permissions
-- your real accounts and what they hold
+### Session cookies
 
-Step 7 restores all of that from `HW-Backend\keycloak\realm-roles-export.json`,
-which was exported from the Linux realm and is in the copy you already have.
-
----
-
-## 1. Install the prerequisites
-
-| Software | Version | Notes |
+| Cookie | Purpose | Browser-readable |
 | --- | --- | --- |
-| JDK | **21** | Temurin or Microsoft Build of OpenJDK. Keycloak 26.7 requires it. |
-| Python | **3.12** | Tick "Add python.exe to PATH" in the installer. |
-| PostgreSQL | 16 or 17 | Note the `postgres` password the installer asks for. |
+| `__Host-session` | Opaque session id. The server uses it to find tokens in SQLite. | No (`HttpOnly`) |
+| `__Host-txn` | Short-lived binding for an in-progress login transaction. | No (`HttpOnly`) |
+| `__Host-csrf` | Per-session double-submit CSRF token. | Yes, so the SPA can echo it in `X-CSRF-Token` |
 
-Confirm each, in a new PowerShell window:
+Cookie flags and names are configured centrally. In production, use secure cookies and an appropriate same-site policy.
 
-```powershell
-java -version        # openjdk version "21..."
-py -3.12 -V          # Python 3.12.x
-psql --version       # psql (PostgreSQL) 16.x or 17.x
+## Session Requests and Refresh
+
+- `GET /api/v1/auth/token` returns the current session state. Signed out is a normal `200` response with `authenticated: false`.
+- `GET /api/v1/auth/me` returns the authenticated identity and current realm roles.
+- `POST /api/v1/auth/refresh` rotates the token set immediately.
+- `POST /api/v1/auth/logout` revokes the refresh token when possible, deletes the local session, clears cookies, and returns a Keycloak logout URL for the SPA to navigate to.
+
+For authenticated requests, the shell API:
+
+1. Reads the opaque session id from the cookie.
+2. Rejects missing, idle-expired, or absolute-expired sessions.
+3. Enforces origin and double-submit CSRF checks on unsafe methods.
+4. Refreshes the access token ahead of expiry.
+5. Verifies the access token before creating the current user.
+6. Slides the idle timeout by reissuing the cookies.
+
+Refresh-token rotation is serialized per session. This is required because Keycloak is configured with zero refresh-token reuse; two concurrent refreshes must not submit the same refresh token.
+
+## Authorization and Roles
+
+Authentication proves the identity. Authorization is performed separately.
+
+- `CurrentUser` in the shell API is defined in `ips_fusionhub_shell_api/app/auth/deps.py`.
+- `CurrentUser` in the admin API is defined in `ips_fusionhub_admin_api/app/auth/deps.py`.
+- `require_realm_role("role-name")` creates a FastAPI dependency for role-protected routes.
+- Effective realm roles are read from Keycloak's Admin REST API and cached briefly. They are not trusted solely from the token because a role can be removed after the token was minted.
+- Role changes made through the service invalidate the relevant local role cache. Changes made directly in Keycloak become visible after the cache TTL.
+
+The admin API's domain routers attach these dependencies to protected operations. The API's own `admin_role` setting defines the realm role allowed to administer users, roles, modules, and permissions.
+
+## Admin API Authentication Paths
+
+The admin API supports two request styles in `ips_fusionhub_admin_api/app/auth/deps.py`:
+
+### Bearer access token
+
+A caller sends:
+
+```http
+Authorization: Bearer <access-token>
 ```
 
-If `psql` is not found, add PostgreSQL's `bin` to `PATH`, e.g.
-`C:\Program Files\PostgreSQL\17\bin`.
+`HTTPBearer` extracts the credential and `app/auth/token.py` verifies it. The verifier checks:
 
-Set `JAVA_HOME` — `kc.bat` will not start without it:
+- the signing algorithm;
+- the `kid` and Keycloak public signing key;
+- required `exp`, `iat`, `iss`, `sub`, and `aud` claims;
+- the configured issuer and audience;
+- the access-token type;
+- optional allowed client ids.
 
-```powershell
-$env:JAVA_HOME = 'C:\Program Files\Eclipse Adoptium\jdk-21.0.5.11-hotspot'
-```
+### Shell session cookie
 
-Make it permanent so new windows have it:
+When no bearer header is present, the admin API forwards the caller's `Cookie` header to the shell API's `/api/v1/auth/me` endpoint. The returned profile becomes the admin API's `TokenUser` representation. This keeps browser session credentials in the shell while allowing admin routes to use the same `CurrentUser` and role dependencies.
 
-```powershell
-[Environment]::SetEnvironmentVariable('JAVA_HOME', $env:JAVA_HOME, 'User')
-```
+## Keycloak and Token Verification Code Map
 
----
+### Shell API: browser-facing BFF
 
-## 2. Create the two databases
+| Responsibility | Code |
+| --- | --- |
+| Route registration and `/api/v1` prefix | `ips_fusionhub_shell_api/app/main.py`, `ips_fusionhub_shell_api/app/api.py` |
+| Login, callback, session state, refresh, logout | `ips_fusionhub_shell_api/app/auth/router.py` |
+| Authorization URL, PKCE, code exchange, refresh, revocation, ID-token validation | `ips_fusionhub_shell_api/app/auth/oidc.py` |
+| Session lookup, transaction storage, expiry, refresh locking | `ips_fusionhub_shell_api/app/auth/session_store.py` |
+| Cookie names and security flags | `ips_fusionhub_shell_api/app/auth/cookies.py` |
+| Origin and double-submit CSRF checks | `ips_fusionhub_shell_api/app/auth/csrf.py` |
+| Session-to-user dependency and automatic refresh | `ips_fusionhub_shell_api/app/auth/deps.py` |
+| JWT claims-to-user mapping and access-token verification | `ips_fusionhub_shell_api/app/auth/token.py` |
+| Live Keycloak realm-role lookup | `ips_fusionhub_shell_api/app/auth/live_roles.py` |
+| OIDC URLs, cookie settings, lifetimes, issuer, audience | `ips_fusionhub_shell_api/app/core/config.py` |
+| Startup session database and JWKS initialization | `ips_fusionhub_shell_api/app/main.py` |
 
-Keycloak and the shell API each get their own database and their own owner.
-This is not optional: since PostgreSQL 15 a non-owner cannot create tables in
-`public`, and both applications create their tables on first run.
+### Admin API: resource server and admin operations
 
-`sudo -u postgres` does not exist here; connect as `postgres` with the password
-from the installer.
+| Responsibility | Code |
+| --- | --- |
+| Bearer or shell-cookie authentication dependency | `ips_fusionhub_admin_api/app/auth/deps.py` |
+| JWT signature and claim validation | `ips_fusionhub_admin_api/app/auth/token.py` |
+| Cached Keycloak public signing keys | `ips_fusionhub_admin_api/app/auth/jwks.py` |
+| Live realm-role lookup and cache invalidation | `ips_fusionhub_admin_api/app/auth/live_roles.py` |
+| Keycloak Admin REST client and service-account token handling | `ips_fusionhub_admin_api/app/core/keycloak_admin.py` |
+| Protected route composition | `ips_fusionhub_admin_api/app/api.py` |
+| Admin API settings, including shell URL and token validation | `ips_fusionhub_admin_api/app/core/config.py` |
 
-```powershell
-psql -U postgres
-```
+## Keycloak Realm Setup
 
-At the `postgres=#` prompt:
+The local realm setup is defined by `ips_fusionhub_shell_api/keycloak/setup_local_dev.py`. It is idempotent and provisions the application clients, login flow, local developer user, role assignments, redirect URIs, token settings, and service-account permissions.
 
-```sql
-CREATE ROLE keycloak   LOGIN PASSWORD 'local-keycloak-db';
-CREATE ROLE shell_auth LOGIN PASSWORD 'local-shell-session-db';
-CREATE DATABASE keycloak   OWNER keycloak;
-CREATE DATABASE shell_auth OWNER shell_auth;
-\q
-```
+The intended clients are:
 
-Verify both roles can actually create tables — a wrong owner surfaces much
-later as a confusing runtime error:
+- `session`: the confidential shell/BFF client. The shell owns the code exchange and keeps its secret server-side. PKCE is also required.
+- `users`: a confidential service-account client used by backend code for Keycloak Admin REST operations and development login-token creation. It is not a browser login client.
 
-```powershell
-$env:PGPASSWORD='local-keycloak-db'
-psql -h 127.0.0.1 -U keycloak -d keycloak -c "CREATE TABLE _probe(i int); DROP TABLE _probe;"
+Redirect URI configuration must match the shell settings exactly. The SPA callback is derived from `FRONTEND_URL` and `AUTH_CALLBACK_PATH`; the API URL is not the browser callback.
 
-$env:PGPASSWORD='local-shell-session-db'
-psql -h 127.0.0.1 -U shell_auth -d shell_auth -c "CREATE TABLE _probe(i int); DROP TABLE _probe;"
+On Windows, `scripts/windows/env.cmd` supplies local defaults and discovers the Keycloak installation. `scripts/windows/start.cmd` starts the local services and runs the optional realm setup when the setup script is available.
 
-Remove-Item Env:\PGPASSWORD
-```
+## Development-Only Email Login
 
-Both must print `DROP TABLE`.
+When enabled by `ENABLE_DEV_LOGIN`, the shell exposes `POST /api/v1/auth/login-hint`. The backend uses the `users` service account to obtain a one-time Keycloak login token for a registered email address. The browser then enters the normal authorization-code flow with that hint.
 
----
+This is not a separate authentication mechanism or a token bypass: it still creates a normal Keycloak SSO session and passes through the same callback, ID-token validation, server-side session creation, CSRF protection, refresh, and logout logic. It must remain disabled outside local development.
 
-## 3. Create the Python environment
+## Agent API Authentication
 
-```powershell
-cd C:\SOW2\HW-Backend
-py -3.12 -m venv env
-.\env\Scripts\python.exe -m pip install --upgrade pip
-.\env\Scripts\pip.exe install -r unified-portal-shell-api\requirements.txt
-```
+The agent API does not implement browser user authentication. Its downstream Databricks client is configured with OAuth machine-to-machine credentials:
 
-Upgrading pip first matters: an old pip may try to compile `cryptography` from
-source instead of downloading the prebuilt wheel, which then demands a Rust
-toolchain you do not need.
+- settings: `ips_fusionhub_agent_api/app/core/config.py`;
+- client construction: `ips_fusionhub_agent_api/app/services/databricks_client.py`;
+- token refresh: handled by the Databricks SDK.
 
-Check the imports resolve:
+If the Databricks configuration is incomplete, agent routes return service-unavailable errors rather than attempting to authenticate with a user session.
 
-```powershell
-.\env\Scripts\python.exe -c "import fastapi, uvicorn, asyncpg, jwt, cryptography, pydantic_settings, httpx; print('ok')"
-```
+## Important Configuration
 
----
+Authentication settings are loaded from each service's `.env` file through its `app/core/config.py`. Keep secrets out of source control. The important relationships are:
 
-## 4. Load the Keycloak environment
+- `KEYCLOAK_SERVER_URL` + `KEYCLOAK_REALM` define the issuer and OIDC endpoints.
+- `KEYCLOAK_CLIENT_ID=session` and `KEYCLOAK_CLIENT_SECRET` identify the shell's confidential client.
+- `KEYCLOAK_AUDIENCE` must match the audience mapper configured in Keycloak.
+- `FRONTEND_BASE_URL` and `AUTH_CALLBACK_PATH` must match the Keycloak redirect URI exactly.
+- `FRONTEND_POST_LOGOUT_PATH` must match the registered post-logout redirect URI.
+- `CORS_ORIGINS` must contain every frontend origin that sends credentialed requests.
+- `SESSION_DB_PATH`, idle timeout, absolute timeout, and refresh leeway control local session behavior.
+- `ALLOWED_CLIENTS`, when set, restricts which `azp` values may use bearer tokens.
 
-```powershell
-cd C:\SOW2
-. .\scripts\windows\env.ps1
-```
-
-The leading dot is required — it runs the script in your current window instead
-of a child process, so the variables survive. **These last for this window
-only.** Every new PowerShell window that runs Keycloak or a setup script needs
-this line again.
-
-If PowerShell refuses to run the file:
-
-```powershell
-Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
-```
-
-That relaxes the policy for this window alone, not the machine.
-
----
-
-## 5. Start Keycloak
-
-Give Keycloak its own PowerShell window. It runs in the foreground; Ctrl-C
-stops it. There is no start/stop script on Windows and none is needed.
-
-```powershell
-cd C:\SOW2
-. .\scripts\windows\env.ps1
-.\keycloak-26.7.0\bin\kc.bat start-dev --import-realm --health-enabled=true
-```
-
-First boot takes a minute or two — it builds the Quarkus image and imports the
-realm. Wait until this returns `200`, in a **second** window:
-
-```powershell
-curl.exe -s -o NUL -w "%{http_code}`n" http://localhost:8080/realms/honeywell
-```
-
-> **`curl` in PowerShell is an alias for `Invoke-WebRequest`** and does not
-> understand `-s`, `-o`, `-w` or `-H`. Always type **`curl.exe`**. This is the
-> single most common way these commands appear broken on Windows.
-
-Poll `/realms/honeywell`, not `/realms/master` — master answers before the
-realm import has finished.
-
-The admin console is at <http://localhost:8080/admin/> — `admin` / `admin`.
-
----
-
-## 6. Configure the realm
-
-In the second window:
-
-```powershell
-cd C:\SOW2
-. .\scripts\windows\env.ps1
-cd HW-Backend\keycloak
-..\env\Scripts\python.exe setup_local_dev.py
-```
-
-This creates the `hw-bff` and `hw-users` clients, the local login flow, the
-`developer@example.com` account and the `admin` role. It is idempotent — run it
-again any time. It should end with:
-
-```
-Application clients in the realm: hw-bff, hw-users
-Local development SSO is ready.
-```
-
-The scripts use only the Python standard library, so plain `python` works too
-if you would rather not use the venv.
-
----
-
-## 7. Restore the roles, permissions and users
-
-Still in `HW-Backend\keycloak`:
-
-```powershell
-..\env\Scripts\python.exe import_realm_roles.py
-```
-
-This reads `realm-roles-export.json` and recreates the 13 roles (three job
-roles plus ten permissions), the `developers` composite, and each user with the
-roles it held. Also idempotent — `=` means already present, `*` means created.
-
-No passwords are set. Sign-in is by email address against Keycloak, so the
-accounts work without one.
-
-To refresh the export later, run `export_realm.py` on the machine whose realm
-is correct and copy the resulting JSON across.
-
----
-
-## 8. Start the shell API
-
-**The `.env` needs no Windows edits.** `HW-Backend\unified-portal-shell-api\.env`
-already points at `127.0.0.1:5432` and `localhost:8080`, both correct here.
-
-A third PowerShell window — and note it does **not** need `env.ps1`, because
-the API reads its own `.env`:
-
-```powershell
-cd C:\SOW2\HW-Backend\unified-portal-shell-api
-..\env\Scripts\python.exe -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
-```
-
-Windows Firewall will prompt on first run because of `--host 0.0.0.0`. Allow it
-for private networks, or drop the flag to bind loopback only if nothing off the
-VM needs to reach the API.
-
-Swagger is at <http://localhost:8000/docs>.
-
----
-
-## 9. Verify it actually works
-
-Processes being up proves nothing — a mistyped client secret only fails at
-login. Run all four, in a spare window:
-
-```powershell
-# 1. the process and its database
-curl.exe -s -o NUL -w "ready:    %{http_code}`n" http://localhost:8000/health/ready
-
-# 2. sign in by email, then read back the live roles
-curl.exe -s -H "X-Dev-Email: developer@example.com" http://localhost:8000/api/v1/auth/me
-
-# 3. a guarded endpoint: dev login -> hw-users service account -> role check
-curl.exe -s -o NUL -w "users:    %{http_code}`n" -H "X-Dev-Email: developer@example.com" "http://localhost:8000/api/v1/users?max=1"
-
-# 4. the same endpoint with no credential
-curl.exe -s -o NUL -w "no auth:  %{http_code}`n" "http://localhost:8000/api/v1/users?max=1"
-```
-
-Expected: `200`, a JSON profile whose `roles` include `admin`, `200`, then
-`401`. Together those exercise the whole chain — email sign-in, the service
-account credential, live role lookup from Keycloak, and enforcement.
-
-Then confirm step 7 landed:
-
-```powershell
-curl.exe -s -H "X-Dev-Email: developer@example.com" http://localhost:8000/api/v1/users/permissions
-```
-
-Ten permissions, `permission:admin:view` through `permission:dashboard:view`.
-
----
-
-## Daily routine, once set up
-
-Two windows:
-
-```powershell
-# window 1
-cd C:\SOW2 ; . .\scripts\windows\env.ps1 ; .\keycloak-26.7.0\bin\kc.bat start-dev
-
-# window 2
-cd C:\SOW2\HW-Backend\unified-portal-shell-api
-..\env\Scripts\python.exe -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
-```
-
-`--import-realm` is only needed on a first boot against an empty database.
-Ctrl-C in each window to stop. PostgreSQL runs as a Windows service and looks
-after itself.
-
----
-
-## Troubleshooting
-
-**`Missing Keycloak provider(s): login-token-verifier`**
-`keycloak-26.7.0\providers\keycloak-magic-link-0.75.jar` is missing. Copy it
-back and restart Keycloak — the provider list is read at boot.
-
-**`curl: The remote name could not be resolved` / `A parameter cannot be found that matches parameter name 's'`**
-You used `curl`, which is an alias for `Invoke-WebRequest`. Use `curl.exe`.
-
-**`JAVA_HOME is not set` or `kc.bat` exits immediately**
-Set `JAVA_HOME` to a JDK **21** directory, and check `java -version` agrees.
-
-**Keycloak starts but `/realms/honeywell` stays 404**
-Read the `kc.bat` window first — the import logs there, and it usually says
-exactly what went wrong (a malformed `realm-export.json`, or a realm of that
-name already present so the import was skipped). Fix what it reports. Only if
-it confirms the realm already exists, and you are certain that database holds
-nothing you want, recreate it:
-`DROP DATABASE keycloak; CREATE DATABASE keycloak OWNER keycloak;` then start
-again with `--import-realm`. That erases every user and role in the realm, so
-make sure step 7's export file is current before you do it.
-
-**`FATAL: password authentication failed for user "keycloak"`**
-The role password does not match `KC_DB_PASSWORD` in `env.ps1`. Reset it:
-`ALTER ROLE keycloak PASSWORD 'local-keycloak-db';`
-
-**`invalid_client` at login**
-The client secrets in `scripts\windows\env.ps1` and in
-`unified-portal-shell-api\.env` have drifted apart. They must match.
-
-**`Port 8080 already in use`**
-Docker Desktop running the Compose stack is the usual cause:
-`docker compose stop`. Never `docker compose down -v` — that deletes the
-database volumes.
-
-**Setup scripts fail with a connection error**
-Keycloak is not up yet, or you opened a new window and forgot to dot-source
-`env.ps1`.
+For troubleshooting, compare the effective service settings, Keycloak client redirect URIs/web origins, issuer, audience mapper, and the browser's actual frontend port. A frontend fallback from port `3000` to `3001`, `3002`, or `3003` must be reflected in the configured CORS and Keycloak web-origin lists.
